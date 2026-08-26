@@ -6,8 +6,8 @@
       错位区域(龈缘/邻面错配)不参与求解，最终贴合到 0.1mm 级
 
 交互说明：
-  口扫窗口：只显示口扫，按顺序点 4 个牙尖(关窗)
-  点云窗口：只显示点云，按相同顺序点 4 个对应牙尖(关窗)
+  口扫窗口：直接显示三角网格，按顺序右键点 4 个牙尖后关窗
+  点云窗口：只显示点云，按相同顺序右键点 4 个对应牙尖后关窗
   之后粗配、精配、车针拟合全自动完成，中途若 fitness 达标则跳过确认
   车针：open3d窗口里Shift+左键框选整段钻尖(Ctrl反选)，按Q结束
 """
@@ -193,36 +193,57 @@ def fit_report(src, tgt, Mx, label):
 
 
 # ---------- 选点 ----------
-def pick_idx(pcd, msg):
-    """open3d框选（车针用）：Shift+左键框选，Ctrl反选，按Q结束，返回下标"""
+def pick_idx(geometry, msg):
+    """在Open3D几何体上选顶点，按Q结束并返回顶点下标。"""
     vis = o3d.visualization.VisualizerWithVertexSelection()
     vis.create_window(window_name=msg)
-    vis.add_geometry(pcd)
+    vis.add_geometry(geometry)
     vis.run()
+    picked = vis.get_picked_points()
     vis.destroy_window()
-    return [p.index for p in vis.get_picked_points()]
+    return [p.index for p in picked]
 
 
-def _pv_add(pl, pcd, point_size=3.0, fallback_color="lightblue"):
-    """把open3d点云加进PyVista窗口（有颜色带颜色）"""
-    pdata = pv.PolyData(np.asarray(pcd.points))
+def _pv_add(pl, geometry, point_size=3.0, fallback_color="lightblue"):
+    """把Open3D点云或三角网格加入PyVista窗口，并保留顶点颜色。"""
+    if isinstance(geometry, o3d.geometry.TriangleMesh):
+        vertices = np.asarray(geometry.vertices)
+        triangles = np.asarray(geometry.triangles)
+        faces = np.column_stack(
+            [np.full(len(triangles), 3, dtype=np.int64), triangles]
+        ).ravel()
+        pdata = pv.PolyData(vertices, faces)
+        has_colors = geometry.has_vertex_colors()
+    else:
+        pdata = pv.PolyData(np.asarray(geometry.points))
+        has_colors = geometry.has_colors()
+
     kw = {}
-    if pcd.has_colors():
-        pdata["colors"] = (np.asarray(pcd.colors) * 255).astype(np.uint8)
+    if has_colors:
+        colors = (
+            geometry.vertex_colors
+            if isinstance(geometry, o3d.geometry.TriangleMesh)
+            else geometry.colors
+        )
+        pdata["colors"] = (np.asarray(colors) * 255).astype(np.uint8)
         kw = dict(scalars="colors", rgb=True, preference="point")
     else:
         kw = dict(color=fallback_color)
-    pl.add_mesh(pdata, point_size=point_size, render_points_as_spheres=True, **kw)
+
+    if isinstance(geometry, o3d.geometry.TriangleMesh):
+        pl.add_mesh(pdata, smooth_shading=True, **kw)
+    else:
+        pl.add_mesh(pdata, point_size=point_size, render_points_as_spheres=True, **kw)
 
 
-def pick_click(pcd, msg, solid_color=None):
-    """PyVista单击选点：窗口里只显示本对象，绝不混层，点哪层一目了然。
+def pick_click(geometry, msg, solid_color=None):
+    """PyVista右键选点：窗口里只显示本对象，绝不混层，点哪层一目了然。
     标记球不可拾取 + 最小间距过滤，防重复吸附到上一个点。"""
     pl = pv.Plotter(title=msg)
     if solid_color is not None:
-        _pv_add(pl, pcd, fallback_color=solid_color)
+        _pv_add(pl, geometry, fallback_color=solid_color)
     else:
-        _pv_add(pl, pcd)
+        _pv_add(pl, geometry)
     picked = []
 
     def cb(point, *args):
@@ -241,20 +262,31 @@ def pick_click(pcd, msg, solid_color=None):
         )
         pl.add_text(f"已选 {len(picked)} 点", name="pick_count", font_size=12)
 
-    pl.enable_point_picking(
-        callback=cb,
-        picker="point",
-        left_clicking=True,
-        show_message="左键逐个点选，选完直接关窗",
-    )
+    if isinstance(geometry, o3d.geometry.TriangleMesh):
+        # PointPicker会穿过三角面搜索顶点；CellPicker只返回视线最先命中的表面。
+        pl.enable_surface_point_picking(
+            callback=cb,
+            picker="cell",
+            left_clicking=False,
+            show_message="右键依次选择可见表面上的点，选完直接关窗",
+        )
+    else:
+        pl.enable_point_picking(
+            callback=cb,
+            picker="point",
+            left_clicking=False,
+            show_message="右键逐个点选，选完直接关窗",
+        )
     pl.show()
     return np.array(picked) if picked else np.empty((0, 3))
 
 
-def pick_landmarks(pcd, side, n_points=N_PICK_ROUGH):
-    """一个窗口内按顺序单击 n_points 个特征点；窗口里只显示本对象，不混层"""
+def pick_landmarks(geometry, side, n_points=N_PICK_ROUGH):
+    """一个窗口内按顺序右键选择 n_points 个特征点；只显示当前对象。"""
     while True:
-        pts = pick_click(pcd, f"{side}：按顺序单击{n_points}个特征点，选完关窗")
+        pts = pick_click(
+            geometry, f"{side}：按顺序右键选择{n_points}个特征点，选完关窗"
+        )
         if len(pts) == n_points:
             return pts
         print(f"选了{len(pts)}个，需要恰好{n_points}个，重选")
@@ -284,10 +316,10 @@ while True:
     print(
         f"先在口扫上按顺序选{N_PICK_ROUGH}个特征点（建议：左磨牙尖→右磨牙尖→门牙中缝→尖牙尖，尽量张开跨度）"
     )
-    print("  窗口里只有口扫，点哪个牙尖一目了然")
-    P = pick_landmarks(scan_pcd, "【口扫】", N_PICK_ROUGH)
+    print("  窗口里直接显示口扫三角网格，请右键选择可见表面上的牙尖")
+    P = pick_landmarks(scan, "【口扫】", N_PICK_ROUGH)
     print(f"再在点云上按【相同顺序】选对应的{N_PICK_ROUGH}个点")
-    print("  窗口里只有点云，按顺序点同一批牙尖")
+    print("  窗口里只有点云，请按顺序右键点同一批牙尖")
     Q = pick_landmarks(cloud, "【点云】", N_PICK_ROUGH)
 
     M_rough = kabsch(P, Q)

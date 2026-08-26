@@ -1,12 +1,10 @@
 {
     "[python]": {
-        "editor.formatOnSave": true,
-        "editor.defaultFormatter": "charliermarsh.ruff",
         "editor.codeActionsOnSave": {
             "source.fixAll.ruff": "explicit",
             "source.organizeImports.ruff": "explicit"
-        }
-    },
-    "ruff.lint.run": "onSave",
-    "ruff.interpreter": ["${workspaceFolder}/.venv/Scripts/python.exe"]
+        },
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true
+    }
 }
