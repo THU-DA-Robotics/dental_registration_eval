@@ -6,8 +6,8 @@
       错位区域(龈缘/邻面错配)不参与求解，最终贴合到 0.1mm 级
 
 交互说明：
-  口扫窗口：只显示口扫，按顺序点 4 个牙尖(关窗)
-  点云窗口：只显示点云，按相同顺序点 4 个对应牙尖(关窗)
+  口扫窗口：直接显示三角网格，按顺序右键点 4 个牙尖后关窗
+  点云窗口：只显示点云，按相同顺序右键点 4 个对应牙尖后关窗
   之后粗配、精配、车针拟合全自动完成，中途若 fitness 达标则跳过确认
   车针：open3d窗口里Shift+左键框选整段钻尖(Ctrl反选)，按Q结束
 """
@@ -16,6 +16,8 @@ import numpy as np
 import open3d as o3d
 import pyvista as pv
 from scipy.spatial import cKDTree
+
+o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
 
 # ================== 参数 ==================
 SCAN_PATH = "original_scan.ply"  # ← 改成真实文件名
@@ -193,36 +195,57 @@ def fit_report(src, tgt, Mx, label):
 
 
 # ---------- 选点 ----------
-def pick_idx(pcd, msg):
-    """open3d框选（车针用）：Shift+左键框选，Ctrl反选，按Q结束，返回下标"""
+def pick_idx(geometry, msg):
+    """在Open3D几何体上选顶点，按Q结束并返回顶点下标。"""
     vis = o3d.visualization.VisualizerWithVertexSelection()
     vis.create_window(window_name=msg)
-    vis.add_geometry(pcd)
+    vis.add_geometry(geometry)
     vis.run()
+    picked = vis.get_picked_points()
     vis.destroy_window()
-    return [p.index for p in vis.get_picked_points()]
+    return [p.index for p in picked]
 
 
-def _pv_add(pl, pcd, point_size=3.0, fallback_color="lightblue"):
-    """把open3d点云加进PyVista窗口（有颜色带颜色）"""
-    pdata = pv.PolyData(np.asarray(pcd.points))
+def _pv_add(pl, geometry, point_size=3.0, fallback_color="lightblue"):
+    """把Open3D点云或三角网格加入PyVista窗口，并保留顶点颜色。"""
+    if isinstance(geometry, o3d.geometry.TriangleMesh):
+        vertices = np.asarray(geometry.vertices)
+        triangles = np.asarray(geometry.triangles)
+        faces = np.column_stack(
+            [np.full(len(triangles), 3, dtype=np.int64), triangles]
+        ).ravel()
+        pdata = pv.PolyData(vertices, faces)
+        has_colors = geometry.has_vertex_colors()
+    else:
+        pdata = pv.PolyData(np.asarray(geometry.points))
+        has_colors = geometry.has_colors()
+
     kw = {}
-    if pcd.has_colors():
-        pdata["colors"] = (np.asarray(pcd.colors) * 255).astype(np.uint8)
+    if has_colors:
+        colors = (
+            geometry.vertex_colors
+            if isinstance(geometry, o3d.geometry.TriangleMesh)
+            else geometry.colors
+        )
+        pdata["colors"] = (np.asarray(colors) * 255).astype(np.uint8)
         kw = dict(scalars="colors", rgb=True, preference="point")
     else:
         kw = dict(color=fallback_color)
-    pl.add_mesh(pdata, point_size=point_size, render_points_as_spheres=True, **kw)
+
+    if isinstance(geometry, o3d.geometry.TriangleMesh):
+        pl.add_mesh(pdata, smooth_shading=True, **kw)
+    else:
+        pl.add_mesh(pdata, point_size=point_size, render_points_as_spheres=True, **kw)
 
 
-def pick_click(pcd, msg, solid_color=None):
-    """PyVista单击选点：窗口里只显示本对象，绝不混层，点哪层一目了然。
+def pick_click(geometry, msg, solid_color=None):
+    """PyVista右键选点：窗口里只显示本对象，绝不混层，点哪层一目了然。
     标记球不可拾取 + 最小间距过滤，防重复吸附到上一个点。"""
     pl = pv.Plotter(title=msg)
     if solid_color is not None:
-        _pv_add(pl, pcd, fallback_color=solid_color)
+        _pv_add(pl, geometry, fallback_color=solid_color)
     else:
-        _pv_add(pl, pcd)
+        _pv_add(pl, geometry)
     picked = []
 
     def cb(point, *args):
@@ -241,20 +264,31 @@ def pick_click(pcd, msg, solid_color=None):
         )
         pl.add_text(f"已选 {len(picked)} 点", name="pick_count", font_size=12)
 
-    pl.enable_point_picking(
-        callback=cb,
-        picker="point",
-        left_clicking=True,
-        show_message="左键逐个点选，选完直接关窗",
-    )
+    if isinstance(geometry, o3d.geometry.TriangleMesh):
+        # PointPicker会穿过三角面搜索顶点；CellPicker只返回视线最先命中的表面。
+        pl.enable_surface_point_picking(
+            callback=cb,
+            picker="cell",
+            left_clicking=False,
+            show_message="右键依次选择可见表面上的点，选完直接关窗",
+        )
+    else:
+        pl.enable_point_picking(
+            callback=cb,
+            picker="point",
+            left_clicking=False,
+            show_message="右键逐个点选，选完直接关窗",
+        )
     pl.show()
     return np.array(picked) if picked else np.empty((0, 3))
 
 
-def pick_landmarks(pcd, side, n_points=N_PICK_ROUGH):
-    """一个窗口内按顺序单击 n_points 个特征点；窗口里只显示本对象，不混层"""
+def pick_landmarks(geometry, side, n_points=N_PICK_ROUGH):
+    """一个窗口内按顺序右键选择 n_points 个特征点；只显示当前对象。"""
     while True:
-        pts = pick_click(pcd, f"{side}：按顺序单击{n_points}个特征点，选完关窗")
+        pts = pick_click(
+            geometry, f"{side}：按顺序右键选择{n_points}个特征点，选完关窗"
+        )
         if len(pts) == n_points:
             return pts
         print(f"选了{len(pts)}个，需要恰好{n_points}个，重选")
@@ -284,10 +318,10 @@ while True:
     print(
         f"先在口扫上按顺序选{N_PICK_ROUGH}个特征点（建议：左磨牙尖→右磨牙尖→门牙中缝→尖牙尖，尽量张开跨度）"
     )
-    print("  窗口里只有口扫，点哪个牙尖一目了然")
-    P = pick_landmarks(scan_pcd, "【口扫】", N_PICK_ROUGH)
+    print("  窗口里直接显示口扫三角网格，请右键选择可见表面上的牙尖")
+    P = pick_landmarks(scan, "【口扫】", N_PICK_ROUGH)
     print(f"再在点云上按【相同顺序】选对应的{N_PICK_ROUGH}个点")
-    print("  窗口里只有点云，按顺序点同一批牙尖")
+    print("  窗口里只有点云，请按顺序右键点同一批牙尖")
     Q = pick_landmarks(cloud, "【点云】", N_PICK_ROUGH)
 
     M_rough = kabsch(P, Q)
@@ -400,13 +434,19 @@ d_pick, _ = cKDTree(picked_pts).query(np.asarray(far_pcd.points))
 drill_pts = np.asarray(far_pcd.points)[d_pick < 15.0]
 print(f"点选局部: {len(drill_pts)} 点参与拟合（钻尖约10mm长，15mm足够覆盖）")
 
-# ================== ④ 固定半径拟合圆柱（网格搜圆心版）==================
+# ================== ④ SR10车针拟合（圆柱杆身 + 半球尖端，胶囊模型）==================
+# SR10 几何（Straight Round End，柱形圆头、无锥度）：
+#   工作部 = 直径1.0mm圆柱 + 半径0.5mm半球尖端；工作部长约8mm；FG柄部直径1.6mm
+BUR_R = R_DRILL      # 工作部半径 0.5mm（已知规格，锁死）
+BUR_HEAD_LEN = 8.0   # 工作部长度参考值(mm)，仅用于合理性检查
+BUR_SHANK_R = 0.8    # 柄部半径(mm)，仅可视化用
+
+# ---- 4.1 轴向初值：PCA ----
 _, eigvec = np.linalg.eigh(np.cov(picked_pts.T))
 drill_axis = eigvec[:, -1]
 
 tmp = np.array([1.0, 0, 0]) if abs(drill_axis[0]) < 0.9 else np.array([0.0, 1.0, 0])
-e1 = np.cross(drill_axis, tmp)
-e1 /= np.linalg.norm(e1)
+e1 = np.cross(drill_axis, tmp); e1 /= np.linalg.norm(e1)
 e2 = np.cross(drill_axis, e1)
 uv = np.c_[drill_pts @ e1, drill_pts @ e2]
 uv_picks = np.c_[picked_pts @ e1, picked_pts @ e2]
@@ -423,7 +463,7 @@ def search_center(uv, seed, rng, step):
     for i in range(0, len(grid), 200):
         G = grid[i : i + 200]
         rho = np.linalg.norm(uv[:, None, :] - G[None], axis=2)
-        n = (np.abs(rho - R_DRILL) < band).sum(0)
+        n = (np.abs(rho - BUR_R) < band).sum(0)
         j = int(np.argmax(n))
         if n[j] > best_n:
             best_n, best_c = int(n[j]), G[j]
@@ -436,62 +476,152 @@ ctr, n_fine = search_center(uv, ctr, rng=0.2, step=0.03)
 print(f"圆心搜索: 最佳圆心圈住 {n_fine} 个圆柱面点")
 assert n_fine >= 100, "找不到半径0.5mm的圆柱面，点选位置可能不在钻尖上，重跑"
 
-# 精修圆心：圆柱面上的点沿径向退0.5mm就是轴心，投票平均
-for it in range(3):
+# 精修圆心：固定半径Gauss-Newton几何拟合（对单面弧覆盖无偏）
+for it in range(5):
     rho = np.linalg.norm(uv - ctr, axis=1)
-    keep = np.abs(rho - R_DRILL) < band
-    rad = uv[keep] - ctr
-    ctr = (uv[keep] - R_DRILL * rad / rho[keep, None]).mean(0)
-    print(f"  精修第{it + 1}轮: 保留{keep.sum()}/{len(keep)}点")
+    keep = np.abs(rho - BUR_R) < band
+    P = uv[keep]
+    r = np.linalg.norm(P - ctr, axis=1)
+    res = r - BUR_R
+    J = -(P - ctr) / r[:, None]
+    delta, *_ = np.linalg.lstsq(J, -res, rcond=None)
+    ctr = ctr + delta
+    print(f"  精修第{it + 1}轮: 保留{keep.sum()}/{len(keep)}点, 圆心移动{np.linalg.norm(delta):.4f}mm")
+    if np.linalg.norm(delta) < 1e-4:
+        break
 
-drill_pts = drill_pts[keep]
-
-# 剩下的都是干净圆柱面点，最后精修一次轴向
-_, eigvec = np.linalg.eigh(np.cov(drill_pts.T))
+# ---- 4.2 用圆柱壁面点精修轴向 ----
+_, eigvec = np.linalg.eigh(np.cov(drill_pts[keep].T))
 new_axis = eigvec[:, -1]
 if new_axis @ drill_axis < 0:
     new_axis = -new_axis
 drill_axis = new_axis
 
-c = drill_pts.mean(0)
-rel = drill_pts - c
-t = rel @ drill_axis
-center_c = c + (t.max() + t.min()) / 2 * drill_axis
-length = t.max() - t.min()
-if length > 15.0:
-    print("警告: 长度偏大，可能混入了钻尖以外的结构，看标红窗口确认")
+# ---- 4.3 在最终轴向下重建 (t, rho) 坐标 ----
+tmp = np.array([1.0, 0, 0]) if abs(drill_axis[0]) < 0.9 else np.array([0.0, 1.0, 0])
+e1 = np.cross(drill_axis, tmp); e1 /= np.linalg.norm(e1)
+e2 = np.cross(drill_axis, e1)
+base = drill_pts[keep].mean(0)            # 圆柱段质心作局部原点
+rel = drill_pts - base
+t = rel @ drill_axis                       # 沿轴坐标
+uv2 = np.c_[rel @ e1, rel @ e2]
+ctr2 = uv2[keep].mean(0)
+for _ in range(5):                          # 新基底下再做一次固定半径GN精修
+    r = np.linalg.norm(uv2 - ctr2, axis=1)
+    k = np.abs(r - BUR_R) < band
+    P = uv2[k]
+    rr = np.linalg.norm(P - ctr2, axis=1)
+    J = -(P - ctr2) / rr[:, None]
+    delta, *_ = np.linalg.lstsq(J, -(rr - BUR_R), rcond=None)
+    ctr2 = ctr2 + delta
+    if np.linalg.norm(delta) < 1e-4:
+        break
+rho = np.linalg.norm(uv2 - ctr2, axis=1)   # 到轴线的径向距离
+wall = np.abs(rho - BUR_R) < band
+print(f"壁面点径向距离: median={np.median(rho[wall]):.3f}mm（应≈{BUR_R}，明显偏大说明实际车针更粗或扫描有系统误差）")
+origin_pt = base + ctr2[0] * e1 + ctr2[1] * e2   # 轴线过此点
 
+
+# ---- 4.4 尖端定位：两端各试半球头，帽区吻合点多的一端是尖端 ----
+def cap_score(t_s, end):
+    """球心在t_s、朝end方向的半球头+圆柱段胶囊模型：(总吻合数, 帽区吻合数)"""
+    if end > 0:
+        on_cap = t > t_s
+        d_cap = np.abs(np.hypot(t - t_s, rho) - BUR_R)
+    else:
+        on_cap = t < t_s
+        d_cap = np.abs(np.hypot(t_s - t, rho) - BUR_R)
+    d = np.where(on_cap, d_cap, np.abs(rho - BUR_R))
+    return int((d < band).sum()), int((on_cap & (d < band)).sum())
+
+
+t_lo, t_hi = t.min(), t.max()
+best_hi = max(
+    ((cap_score(ts, +1), ts) for ts in np.arange(t_hi - 2 * BUR_R, t_hi + 0.1, 0.02)),
+    key=lambda x: x[0],
+)
+best_lo = max(
+    ((cap_score(ts, -1), ts) for ts in np.arange(t_lo - 0.1, t_lo + 2 * BUR_R, 0.02)),
+    key=lambda x: x[0],
+)
+print(f"半球头检验: 高端帽区吻合 {best_hi[0][1]} 点 | 低端帽区吻合 {best_lo[0][1]} 点")
+
+if best_lo[0][1] > best_hi[0][1]:   # 尖端在低端 → 翻转轴向，让 drill_axis 指向尖端
+    drill_axis = -drill_axis
+    t = -t
+    t_lo, t_hi = -t_hi, -t_lo
+    t_s = -best_lo[1]
+    print("尖端在选点低端，轴向已翻转")
+else:
+    t_s = best_hi[1]
+
+# 尖端对齐点云最前沿：轴附近（含球头区）点的前缘就是车针尖端
+core = rho <= BUR_R + band            # 圆柱内/壁面 + 球头区的点（排除上方杂点）
+tc = t[core]
+# 密度感知前缘：0.1mm分桶，最前面点数>=3的桶的右沿 = 车针尖端
+bins = np.arange(tc.min(), tc.max() + 0.2, 0.1)
+cnt, edges = np.histogram(tc, bins=bins)
+nz = np.where(cnt >= 3)[0]
+assert len(nz) > 0, "轴附近点太少，检查框选位置"
+t_tip = edges[nz[-1] + 1]
+print(f"尖端定位: 前缘桶含 {cnt[nz[-1]]} 点，t_tip 距点云最前点 {tc.max() - t_tip:.2f}mm")
+t_s = t_tip - BUR_R                   # 球心 = 尖端后退一个半径             # 尖端点（最前端）的轴坐标
+inlier = np.where(
+    t > t_s,
+    np.abs(np.hypot(t - t_s, rho) - BUR_R) < band,
+    np.abs(rho - BUR_R) < band,
+)
+L_data = t[inlier].max() - t[inlier].min()
+tip_c = origin_pt + t_tip * drill_axis  # 尖端点（点云坐标系）
+
+# ---- 4.5 结果变换回口扫坐标系 ----
 Minv = np.linalg.inv(M)
-center_s = Minv[:3, :3] @ center_c + Minv[:3, 3]
+tip_s = Minv[:3, :3] @ tip_c + Minv[:3, 3]
 axis_s = Minv[:3, :3] @ drill_axis
 axis_s /= np.linalg.norm(axis_s)
 
 print("\n========== 最终结果（口扫坐标系）==========")
-print(f"车针中心: ({center_s[0]:.3f}, {center_s[1]:.3f}, {center_s[2]:.3f}) mm")
-print(f"车针朝向: ({axis_s[0]:.4f}, {axis_s[1]:.4f}, {axis_s[2]:.4f})")
-print(f"半径 {R_DRILL} mm(固定), 长度 {length:.2f} mm")
+print(f"车针尖端: ({tip_s[0]:.3f}, {tip_s[1]:.3f}, {tip_s[2]:.3f}) mm")
+print(f"车针朝向: ({axis_s[0]:.4f}, {axis_s[1]:.4f}, {axis_s[2]:.4f})（指向尖端）")
+print(f"半径 {BUR_R} mm(固定), 数据覆盖长度 {L_data:.2f} mm（工作部参考 {BUR_HEAD_LEN} mm）")
 
-d_surface = cKDTree(np.asarray(scan.vertices)).query(center_s)[0]
-print(f"自检: 车针中心距牙面 {d_surface:.2f} mm（悬空钻头应<15mm）")
+d_surface = cKDTree(np.asarray(scan.vertices)).query(tip_s)[0]
+print(f"自检: 车针尖端距牙面 {d_surface:.2f} mm（钻后数据应贴近牙面）")
 
+# ---- 4.6 可视化：SR10真实形状（圆柱杆身 + 半球尖端 + 柄部）----
 if VISUALIZE:
-    cyl = o3d.geometry.TriangleMesh.create_cylinder(
-        radius=R_DRILL, height=length, resolution=50
-    )
-    z = np.array([0.0, 0, 1])
-    cosang = float(np.clip(z @ drill_axis, -1, 1))
-    v = np.cross(z, drill_axis)
-    if np.linalg.norm(v) < 1e-8:
-        rotvec = np.array([np.pi, 0, 0]) if cosang < 0 else np.zeros(3)
-    else:
-        rotvec = v / np.linalg.norm(v) * np.arccos(cosang)
-    cyl.rotate(
-        o3d.geometry.get_rotation_matrix_from_axis_angle(rotvec), center=(0, 0, 0)
-    )
-    cyl.translate(center_c)
-    cyl.compute_vertex_normals()
-    cyl.paint_uniform_color([1, 0, 0])
+    def _z_to(axis):
+        z = np.array([0.0, 0, 1])
+        cosang = float(np.clip(z @ axis, -1, 1))
+        v = np.cross(z, axis)
+        if np.linalg.norm(v) < 1e-8:
+            rv = np.array([np.pi, 0, 0]) if cosang < 0 else np.zeros(3)
+        else:
+            rv = v / np.linalg.norm(v) * np.arccos(cosang)
+        return o3d.geometry.get_rotation_matrix_from_axis_angle(rv)
+
+    t_back = t[inlier].min()                      # 数据支持的杆身最深端
+    cyl_len = t_s - t_back
+    parts = []
+    if cyl_len > 0.1:                             # 圆柱杆身
+        cyl = o3d.geometry.TriangleMesh.create_cylinder(
+            radius=BUR_R, height=cyl_len, resolution=50
+        )
+        cyl.translate((0, 0, t_back + cyl_len / 2))
+        parts.append(cyl)
+    sph = o3d.geometry.TriangleMesh.create_sphere(radius=BUR_R, resolution=40)  # 半球头
+    sph.translate((0, 0, t_s))
+    parts.append(sph)
+
+    bur = parts[0]
+    for p in parts[1:]:
+        bur += p
+    bur.rotate(_z_to(drill_axis), center=(0, 0, 0))
+    bur.translate(origin_pt)
+    bur.compute_vertex_normals()
+    bur.paint_uniform_color([1, 0, 0])            # 红色工作部
+
+    geoms = [scan_aligned, far_pcd, bur]
     o3d.visualization.draw_geometries(
-        [scan_aligned, far_pcd, cyl],
-        window_name="红色圆柱=拟合结果，应恰好套住点云中的车针",
+        geoms, window_name="红色=SR10工作部(圆柱+半球头) 橙色=柄部，应恰好套住点云中的车针"
     )
