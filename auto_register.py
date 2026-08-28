@@ -490,89 +490,89 @@ for it in range(5):
     if np.linalg.norm(delta) < 1e-4:
         break
 
-# ---- 4.2 用圆柱壁面点精修轴向 ----
-_, eigvec = np.linalg.eigh(np.cov(drill_pts[keep].T))
-new_axis = eigvec[:, -1]
-if new_axis @ drill_axis < 0:
-    new_axis = -new_axis
-drill_axis = new_axis
+# ---- 4.2 轴心+轴向联合精修：固定半径圆柱几何最小二乘（GN，4自由度）----
+# PCA轴向对单面弧覆盖有偏；直接最小化 点到轴线距离-R，同时修轴心和轴向
+# ctr是绝对投影坐标，本身已是轴线横向位置；只需补上轴向位置（对齐到点云中部）
+origin = ctr[0] * e1 + ctr[1] * e2 + (drill_pts[keep].mean(0) @ drill_axis) * drill_axis
+axis = drill_axis.copy()
 
-# ---- 4.3 在最终轴向下重建 (t, rho) 坐标 ----
-tmp = np.array([1.0, 0, 0]) if abs(drill_axis[0]) < 0.9 else np.array([0.0, 1.0, 0])
-e1 = np.cross(drill_axis, tmp); e1 /= np.linalg.norm(e1)
-e2 = np.cross(drill_axis, e1)
-base = drill_pts[keep].mean(0)            # 圆柱段质心作局部原点
-rel = drill_pts - base
-t = rel @ drill_axis                       # 沿轴坐标
-uv2 = np.c_[rel @ e1, rel @ e2]
-ctr2 = uv2[keep].mean(0)
-for _ in range(5):                          # 新基底下再做一次固定半径GN精修
-    r = np.linalg.norm(uv2 - ctr2, axis=1)
-    k = np.abs(r - BUR_R) < band
-    P = uv2[k]
-    rr = np.linalg.norm(P - ctr2, axis=1)
-    J = -(P - ctr2) / rr[:, None]
-    delta, *_ = np.linalg.lstsq(J, -(rr - BUR_R), rcond=None)
-    ctr2 = ctr2 + delta
-    if np.linalg.norm(delta) < 1e-4:
+for it in range(8):
+    tmp = np.array([1.0, 0, 0]) if abs(axis[0]) < 0.9 else np.array([0.0, 1.0, 0])
+    e1 = np.cross(axis, tmp); e1 /= np.linalg.norm(e1)
+    e2 = np.cross(axis, e1)
+    rel = drill_pts - origin
+    h = rel @ axis
+    rho = np.linalg.norm(rel - np.outer(h, axis), axis=1)
+    keep = np.abs(rho - BUR_R) < band
+    P = drill_pts[keep]
+    res = rho[keep] - BUR_R
+
+    def residual_fn(org, ax):
+        r_ = P - org
+        h_ = r_ @ ax
+        return np.linalg.norm(r_ - np.outer(h_, ax), axis=1) - BUR_R
+
+    eps = 1e-6
+    J = np.zeros((len(P), 4))
+    J[:, 0] = (residual_fn(origin + eps * e1, axis) - res) / eps   # 轴心沿e1
+    J[:, 1] = (residual_fn(origin + eps * e2, axis) - res) / eps   # 轴心沿e2
+    a1 = axis + eps * e1; a1 /= np.linalg.norm(a1)
+    a2 = axis + eps * e2; a2 /= np.linalg.norm(a2)
+    J[:, 2] = (residual_fn(origin, a1) - res) / eps                # 轴向绕e1倾
+    J[:, 3] = (residual_fn(origin, a2) - res) / eps                # 轴向绕e2倾
+
+    delta, *_ = np.linalg.lstsq(J, -res, rcond=None)
+    origin = origin + delta[0] * e1 + delta[1] * e2
+    axis = axis + delta[2] * e1 + delta[3] * e2
+    axis /= np.linalg.norm(axis)
+    print(f"  联合精修第{it + 1}轮: 保留{keep.sum()}/{len(keep)}点, 修正量{np.linalg.norm(delta):.5f}")
+    if np.linalg.norm(delta) < 1e-5:
         break
-rho = np.linalg.norm(uv2 - ctr2, axis=1)   # 到轴线的径向距离
+
+drill_axis = axis
+origin_pt = origin
+
+# ---- 4.3 最终 (t, rho) 坐标 ----
+rel = drill_pts - origin_pt
+t = rel @ drill_axis                       # 沿轴坐标
+rho = np.linalg.norm(rel - np.outer(t, drill_axis), axis=1)   # 到轴线的径向距离
 wall = np.abs(rho - BUR_R) < band
-print(f"壁面点径向距离: median={np.median(rho[wall]):.3f}mm（应≈{BUR_R}，明显偏大说明实际车针更粗或扫描有系统误差）")
-origin_pt = base + ctr2[0] * e1 + ctr2[1] * e2   # 轴线过此点
+print(f"壁面点径向距离: median={np.median(rho[wall]):.3f}mm（应≈{BUR_R}）")
 
-
-# ---- 4.4 尖端定位：两端各试半球头，帽区吻合点多的一端是尖端 ----
-def cap_score(t_s, end):
-    """球心在t_s、朝end方向的半球头+圆柱段胶囊模型：(总吻合数, 帽区吻合数)"""
-    if end > 0:
-        on_cap = t > t_s
-        d_cap = np.abs(np.hypot(t - t_s, rho) - BUR_R)
-    else:
-        on_cap = t < t_s
-        d_cap = np.abs(np.hypot(t_s - t, rho) - BUR_R)
-    d = np.where(on_cap, d_cap, np.abs(rho - BUR_R))
-    return int((d < band).sum()), int((on_cap & (d < band)).sum())
-
-
-t_lo, t_hi = t.min(), t.max()
-best_hi = max(
-    ((cap_score(ts, +1), ts) for ts in np.arange(t_hi - 2 * BUR_R, t_hi + 0.1, 0.02)),
-    key=lambda x: x[0],
-)
-best_lo = max(
-    ((cap_score(ts, -1), ts) for ts in np.arange(t_lo - 0.1, t_lo + 2 * BUR_R, 0.02)),
-    key=lambda x: x[0],
-)
-print(f"半球头检验: 高端帽区吻合 {best_hi[0][1]} 点 | 低端帽区吻合 {best_lo[0][1]} 点")
-
-if best_lo[0][1] > best_hi[0][1]:   # 尖端在低端 → 翻转轴向，让 drill_axis 指向尖端
-    drill_axis = -drill_axis
-    t = -t
-    t_lo, t_hi = -t_hi, -t_lo
-    t_s = -best_lo[1]
-    print("尖端在选点低端，轴向已翻转")
-else:
-    t_s = best_hi[1]
-
-# 尖端对齐点云最前沿：轴附近（含球头区）点的前缘就是车针尖端
-core = rho <= BUR_R + band            # 圆柱内/壁面 + 球头区的点（排除上方杂点）
+# ---- 4.4 尖端定位：SF10为平头，两端都是平面；点云前缘即端面，朝牙面的一端是尖端 ----
+core = rho <= BUR_R + band
 tc = t[core]
-# 密度感知前缘：0.1mm分桶，最前面点数>=3的桶的右沿 = 车针尖端
+
 bins = np.arange(tc.min(), tc.max() + 0.2, 0.1)
 cnt, edges = np.histogram(tc, bins=bins)
 nz = np.where(cnt >= 3)[0]
 assert len(nz) > 0, "轴附近点太少，检查框选位置"
-t_tip = edges[nz[-1] + 1]
-print(f"尖端定位: 前缘桶含 {cnt[nz[-1]]} 点，t_tip 距点云最前点 {tc.max() - t_tip:.2f}mm")
-t_s = t_tip - BUR_R                   # 球心 = 尖端后退一个半径             # 尖端点（最前端）的轴坐标
-inlier = np.where(
-    t > t_s,
-    np.abs(np.hypot(t - t_s, rho) - BUR_R) < band,
-    np.abs(rho - BUR_R) < band,
-)
-L_data = t[inlier].max() - t[inlier].min()
-tip_c = origin_pt + t_tip * drill_axis  # 尖端点（点云坐标系）
+t_front = edges[nz[-1] + 1]           # 高端端面（密度感知前缘）
+# 端面精修：端面圆盘点的轴向中位数 = 真实端面位置（修正桶右沿的+0.1mm前冲）
+face = (rho < BUR_R - band) & (t > t_front - 0.3)
+if face.sum() >= 5:
+    t_front = float(np.median(t[face]))
+    print(f"端面精修: {face.sum()}个端面点参与定位")
+else:
+    t_front = t_front - 0.05          # 端面点太少，退回桶中心
+    print("端面点不足，按桶中心定位")
+t_back = edges[nz[0]]                 # 低端端面
+
+# 朝向判断：车针指向被钻牙齿，离牙面近的一端是尖端
+tree_scan = cKDTree(np.asarray(scan_aligned.vertices))
+d_hi = tree_scan.query(origin_pt + t_front * drill_axis)[0]
+d_lo = tree_scan.query(origin_pt + t_back * drill_axis)[0]
+print(f"端面距牙面: 高端 {d_hi:.2f}mm | 低端 {d_lo:.2f}mm（近的一端定为尖端）")
+if d_lo < d_hi:
+    drill_axis = -drill_axis
+    t = -t
+    t_front, t_back = -t_back, -t_front
+    print("尖端在选点低端，轴向已翻转")
+
+t_tip = t_front
+tip_c = origin_pt + t_tip * drill_axis  # 尖端端面中心（点云坐标系）
+L_data = t_front - t_back
+print(f"尖端定位: 端面桶含 {cnt[nz[-1]]} 点，覆盖长度 {L_data:.2f}mm")
 
 # ---- 4.5 结果变换回口扫坐标系 ----
 Minv = np.linalg.inv(M)
@@ -588,8 +588,23 @@ print(f"半径 {BUR_R} mm(固定), 数据覆盖长度 {L_data:.2f} mm（工作�
 d_surface = cKDTree(np.asarray(scan.vertices)).query(tip_s)[0]
 print(f"自检: 车针尖端距牙面 {d_surface:.2f} mm（钻后数据应贴近牙面）")
 
-# ---- 4.6 可视化：SR10真实形状（圆柱杆身 + 半球尖端 + 柄部）----
+# ---- 4.6 可视化：signed distance染色 + 实体SF10(严格8.0mm)，按C切换显隐 ----
 if VISUALIZE:
+    # ① signed distance 染色（绿=面上 红=偏外 蓝=偏内，±0.1mm满色）
+    sd = np.maximum(
+        rho - BUR_R,
+        np.maximum(t - t_tip, (t_tip - BUR_HEAD_LEN) - t),
+    )
+    sc = np.clip(sd / 0.1, -1, 1)
+    colors = np.zeros((len(sd), 3))
+    pos = sc > 0
+    colors[pos] = np.c_[sc[pos], 1 - sc[pos], np.zeros(pos.sum())]
+    colors[~pos] = np.c_[np.zeros((~pos).sum()), 1 + sc[~pos], -sc[~pos]]
+    drill_colored = o3d.geometry.PointCloud()
+    drill_colored.points = o3d.utility.Vector3dVector(drill_pts)
+    drill_colored.colors = o3d.utility.Vector3dVector(colors)
+
+    # ② 实体SF10：严格从尖端向后 8.0mm
     def _z_to(axis):
         z = np.array([0.0, 0, 1])
         cosang = float(np.clip(z @ axis, -1, 1))
@@ -600,28 +615,32 @@ if VISUALIZE:
             rv = v / np.linalg.norm(v) * np.arccos(cosang)
         return o3d.geometry.get_rotation_matrix_from_axis_angle(rv)
 
-    t_back = t[inlier].min()                      # 数据支持的杆身最深端
-    cyl_len = t_s - t_back
-    parts = []
-    if cyl_len > 0.1:                             # 圆柱杆身
-        cyl = o3d.geometry.TriangleMesh.create_cylinder(
-            radius=BUR_R, height=cyl_len, resolution=50
-        )
-        cyl.translate((0, 0, t_back + cyl_len / 2))
-        parts.append(cyl)
-    sph = o3d.geometry.TriangleMesh.create_sphere(radius=BUR_R, resolution=40)  # 半球头
-    sph.translate((0, 0, t_s))
-    parts.append(sph)
-
-    bur = parts[0]
-    for p in parts[1:]:
-        bur += p
+    bur = o3d.geometry.TriangleMesh.create_cylinder(
+        radius=BUR_R, height=BUR_HEAD_LEN, resolution=50
+    )
+    bur.translate((0, 0, t_tip - BUR_HEAD_LEN / 2))
     bur.rotate(_z_to(drill_axis), center=(0, 0, 0))
     bur.translate(origin_pt)
     bur.compute_vertex_normals()
-    bur.paint_uniform_color([1, 0, 0])            # 红色工作部
+    bur.paint_uniform_color([1.0, 0.0, 1.0])      # 品红，和红绿蓝染色点区分
 
-    geoms = [scan_aligned, far_pcd, bur]
-    o3d.visualization.draw_geometries(
-        geoms, window_name="红色=SR10工作部(圆柱+半球头) 橙色=柄部，应恰好套住点云中的车针"
-    )
+    # ③ 按 C 显示/隐藏车针模型
+    print("提示：可视化窗口中按 C 键 显示/隐藏 品红色车针模型（绿=面上 红=偏外 蓝=偏内）")
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(window_name="验收：按C切换车针模型显隐")
+    vis.add_geometry(scan_aligned)
+    vis.add_geometry(drill_colored)
+    vis.add_geometry(bur)
+    state = {"on": True}
+
+    def toggle(v):
+        if state["on"]:
+            v.remove_geometry(bur, reset_bounding_box=False)
+        else:
+            v.add_geometry(bur, reset_bounding_box=False)
+        state["on"] = not state["on"]
+        return False
+
+    vis.register_key_callback(ord("C"), toggle)
+    vis.run()
+    vis.destroy_window()
