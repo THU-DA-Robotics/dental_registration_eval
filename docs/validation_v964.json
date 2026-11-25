@@ -1,0 +1,71 @@
+{
+  "script_version": "v9.6.4",
+  "source_sha256": "0266e9d2611ada427c3f3954c674dfdd65b2b989a88d35e3daec44d4187c868b",
+  "comparison_base_commit": "9b1200aaea32c165dbb7d29d2d561c2b50054676",
+  "tests": {
+    "passed": 40,
+    "failed": 0,
+    "groups": {
+      "sphere_geometry": 7,
+      "depth_calibration": 7,
+      "cuda_numerics": 12,
+      "manual_bridge": 10,
+      "windows_launchers": 4
+    },
+    "hardware": "NVIDIA GeForce RTX 5060 Laptop GPU",
+    "manual_gui_point_selection_exercised": false,
+    "pyvista_point_conversion_exercised": true
+  },
+  "actual_data_precheck": {
+    "raw_ply_files": 50,
+    "generated_files_excluded": 5,
+    "invalid_files": 0,
+    "registration_performed": false
+  },
+  "v964_full_registration_benchmark_performed": false,
+  "historical_benchmarks": {
+    "note": "Historical v9.5.0 and v9.6.3 local results; not a v9.6.4 or remote-v9.3 benchmark. Different algorithm modes.",
+    "input_files": 213,
+    "unique_content_frames": 207,
+    "hardware": "NVIDIA GeForce RTX 5060 Laptop GPU",
+    "v950": {
+      "elapsed_seconds": 728.235,
+      "accepted": 187,
+      "mode": "cuda_no_reference",
+      "pair_cache_reuse_requested": false
+    },
+    "v963": {
+      "elapsed_seconds": 294.188,
+      "accepted": 213,
+      "mode": "cuda_sphere_and_surface_reference_with_depth_calibration",
+      "fresh_prepared_pair_pose_and_cupy_caches": true,
+      "script_sha256": "03ad3b32d9ff5b18155680b13a16cfd2f0953e79fda3c41bc61f05fd7629b5df"
+    }
+  },
+  "historical_four_sphere_evaluation": {
+    "unit": "mm",
+    "fit_threshold": 0.5,
+    "same_subset_frames": 187,
+    "v950_same187": {
+      "center_distance_rmse": 0.2110294698791225,
+      "diameter_mae": 0.42216183840445254
+    },
+    "v963_same187": {
+      "center_distance_rmse": 0.09425170721004666,
+      "diameter_mae": 0.23006269109926958
+    },
+    "v963_all213": {
+      "center_distance_rmse": 0.09800031442716256,
+      "diameter_mae": 0.23402147317332078
+    },
+    "calibration_pdf_used_for_optimization": false,
+    "surface_reference_used_for_optimization": true,
+    "absolute_whole_scene_accuracy_verified": false,
+    "strict_no_regression_of_every_metric": false
+  },
+  "timing_policy": {
+    "target_seconds": 300,
+    "manual_wait_included": true,
+    "drop_tasks_to_meet_deadline": false
+  }
+}
