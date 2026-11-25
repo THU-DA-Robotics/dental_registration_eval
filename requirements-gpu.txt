@@ -1,0 +1,2 @@
+# Optional CUDA 13 runtime; install after uv sync (do not mix CuPy distributions).
+cupy-cuda13x[ctk]==14.2.0

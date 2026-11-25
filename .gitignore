@@ -1,3 +1,16 @@
 .venv/
 __pycache__/
 point_cloud.ply
+
+# CUDA build cache and private machine configuration
+.cupy_cache/
+gpu_environment.local.cmd
+# Registration run artifacts (tracked historical files remain untouched)
+multiview_output*/
+prepared_frames/
+*.bak
+*.npz
+merged_cloud*.ply
+merged_by_frame.ply
+manual_target_before_rescue.ply
+source_style_main_before_rescue.ply
